@@ -1,7 +1,7 @@
 """
-Instagram Watcher - Narzędzie CLI oparte na yt-dlp i curl-cffi do monitorowania
-publicznego profilu Instagram i pobierania multimediów w maksymalnej dostępnej jakości.
-Pliki są kategoryzowane do podfolderów 'images' oraz 'videos'.
+Instagram Watcher - CLI tool powered by yt-dlp and curl-cffi to monitor
+a public Instagram profile and download media in maximum available quality.
+Files are categorized into 'images' and 'videos' subdirectories.
 """
 
 import argparse
@@ -22,7 +22,7 @@ try:
 except ImportError:
     imageio_ffmpeg = None
 
-# Konfiguracja logowania
+# Logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -32,7 +32,7 @@ logger = logging.getLogger("InstagramWatcher")
 
 
 def get_ffmpeg_path() -> Optional[str]:
-    """Zwraca ścieżkę do pliku wykonywalnego ffmpeg (z imageio_ffmpeg lub systemowego PATH)."""
+    """Return path to ffmpeg executable (from imageio_ffmpeg or system PATH)."""
     if imageio_ffmpeg is not None:
         try:
             return imageio_ffmpeg.get_ffmpeg_exe()
@@ -42,7 +42,7 @@ def get_ffmpeg_path() -> Optional[str]:
 
 
 def extract_username(profile_input: str) -> str:
-    """Wyciąga czystą nazwę użytkownika z podanej nazwy lub pełnego URL."""
+    """Extract clean username from a handle or full profile URL."""
     cleaned = profile_input.strip()
     if "?" in cleaned:
         cleaned = cleaned.split("?")[0]
@@ -57,7 +57,7 @@ def extract_username(profile_input: str) -> str:
 
 
 def load_downloaded_posts(db_path: Path) -> Set[str]:
-    """Wczytuje zbiór pobranych identyfikatorów/shortcode'ów postów z pliku JSON."""
+    """Load the set of downloaded post shortcodes/IDs from a JSON file."""
     if not db_path.is_file():
         return set()
 
@@ -76,12 +76,12 @@ def load_downloaded_posts(db_path: Path) -> Set[str]:
                 return shortcodes
             return set()
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"Nie udało się odczytać bazy {db_path} ({e}), tworzę nowy zbiór.")
+        logger.warning(f"Could not read database {db_path} ({e}), initializing empty set.")
         return set()
 
 
 def save_downloaded_posts(db_path: Path, downloaded_ids: Set[str]) -> None:
-    """Zapisuje zbiór pobranych identyfikatorów do pliku JSON."""
+    """Save the set of downloaded post IDs to a JSON file atomically."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = db_path.with_suffix(".tmp")
     try:
@@ -89,29 +89,29 @@ def save_downloaded_posts(db_path: Path, downloaded_ids: Set[str]) -> None:
             json.dump(sorted(list(downloaded_ids)), f, indent=2, ensure_ascii=False)
         temp_path.replace(db_path)
     except OSError as e:
-        logger.error(f"Błąd zapisu do pliku {db_path}: {e}")
+        logger.error(f"Error saving to file {db_path}: {e}")
         if temp_path.exists():
             temp_path.unlink()
 
 
 def fetch_profile_posts(username: str) -> List[Dict[str, Any]]:
-    """Pobiera listę najnowszych postów z publicznego profilu Instagram."""
+    """Fetch list of recent posts from a public Instagram profile."""
     url = f"https://www.instagram.com/{username}/"
     headers = {
         "Accept-Language": "en-US,en;q=0.9",
     }
-    logger.info(f"Pobieranie osi czasu profilu: {url} ...")
+    logger.info(f"Fetching profile timeline: {url} ...")
     try:
         response = requests.get(url, impersonate="chrome", headers=headers, timeout=25)
     except Exception as e:
-        logger.error(f"Błąd połączenia z Instagramem: {e}")
+        logger.error(f"Connection error while fetching Instagram profile: {e}")
         return []
 
     if response.status_code == 404:
-        logger.error(f"Profil '{username}' nie istnieje (HTTP 404).")
+        logger.error(f"Profile '{username}' does not exist (HTTP 404).")
         return []
     elif response.status_code != 200:
-        logger.error(f"Instagram zwrócił kod HTTP {response.status_code}.")
+        logger.error(f"Instagram returned HTTP {response.status_code}.")
         return []
 
     html = response.text
@@ -152,7 +152,7 @@ def fetch_profile_posts(username: str) -> List[Dict[str, Any]]:
                 pass
 
     if not nodes:
-        logger.debug("Próba odnalezienia postów za pomocą wyrażeń regularnych...")
+        logger.debug("Falling back to regex extraction for post codes...")
         found_codes: List[str] = []
         for s in scripts:
             matches = re.findall(r'"code":"([A-Za-z0-9_-]{10,12})"', s)
@@ -162,28 +162,28 @@ def fetch_profile_posts(username: str) -> List[Dict[str, Any]]:
         for c in found_codes:
             nodes.append({"code": c, "media_type": 1})
 
-    logger.info(f"Odnaleziono {len(nodes)} postów na profilu '{username}'.")
+    logger.info(f"Discovered {len(nodes)} posts on profile '{username}'.")
     return nodes
 
 
 def fetch_post_details(shortcode: str) -> Optional[Dict[str, Any]]:
     """
-    Pobiera pełne metadane posta z dedykowanego widoku https://www.instagram.com/p/<shortcode>/
-    w celu uzyskania listy formatów o najwyższej rozdzielczości (image_versions2, display_resources, carousel_media).
+    Fetch full post metadata from dedicated view https://www.instagram.com/p/<shortcode>/
+    to retrieve highest resolution media formats (image_versions2, display_resources, carousel_media).
     """
     post_url = f"https://www.instagram.com/p/{shortcode}/"
     headers = {
         "Accept-Language": "en-US,en;q=0.9",
     }
-    logger.info(f"Pobieranie szczegółowych metadanych z widoku posta: {post_url} ...")
+    logger.info(f"Fetching detailed metadata from post view: {post_url} ...")
     try:
         response = requests.get(post_url, impersonate="chrome", headers=headers, timeout=25)
     except Exception as e:
-        logger.warning(f"Błąd połączenia podczas pobierania widoku posta {shortcode}: {e}")
+        logger.warning(f"Connection error while fetching post view for {shortcode}: {e}")
         return None
 
     if response.status_code != 200:
-        logger.warning(f"Widok posta {shortcode} zwrócił kod HTTP {response.status_code}.")
+        logger.warning(f"Post view for {shortcode} returned HTTP {response.status_code}.")
         return None
 
     html = response.text
@@ -219,10 +219,10 @@ def fetch_post_details(shortcode: str) -> Optional[Dict[str, Any]]:
 
 def select_best_image_url(media_dict: Dict[str, Any]) -> Optional[str]:
     """
-    Wybiera URL obrazu o najwyższej dostępnej rozdzielczości z metadanych.
-    Priorytet:
-    1. candidates z image_versions2 (wybór najwyższej szerokości x wysokości lub nieprzeskalowanego oryginału)
-    2. display_resources (sortowanie wg config_width * config_height)
+    Select image URL with highest available resolution from metadata.
+    Priority:
+    1. candidates from image_versions2 (highest width x height or uncompressed original)
+    2. display_resources (sorted by config_width * config_height)
     3. display_uri / display_url
     """
     candidates = media_dict.get("image_versions2", {}).get("candidates") or []
@@ -262,7 +262,7 @@ def select_best_image_url(media_dict: Dict[str, Any]) -> Optional[str]:
 
 
 def select_best_video_url(media_dict: Dict[str, Any]) -> Optional[str]:
-    """Wybiera URL wideo o najwyższej rozdzielczości z video_versions."""
+    """Select video URL with highest resolution from video_versions."""
     video_versions = media_dict.get("video_versions") or []
     if video_versions:
         def video_score(v: Dict[str, Any]) -> int:
@@ -276,7 +276,7 @@ def select_best_video_url(media_dict: Dict[str, Any]) -> Optional[str]:
 
 
 def download_file(url: str, output_path: Path) -> bool:
-    """Pobiera plik z podanego URL i zapisuje pod wskazaną ścieżką."""
+    """Download file from URL and save to the specified path."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         r = requests.get(url, impersonate="chrome", timeout=40)
@@ -284,20 +284,20 @@ def download_file(url: str, output_path: Path) -> bool:
             with open(output_path, "wb") as f:
                 f.write(r.content)
             return True
-        logger.error(f"Nie udało się pobrać pliku {output_path.name} (HTTP {r.status_code})")
+        logger.error(f"Failed to download file {output_path.name} (HTTP {r.status_code})")
         return False
     except Exception as e:
-        logger.error(f"Błąd zapisu pliku {output_path.name}: {e}")
+        logger.error(f"Error saving file {output_path.name}: {e}")
         return False
 
 
 def download_image_and_log_dimensions(url: str, output_path: Path) -> bool:
-    """Pobiera obraz z podanego URL i loguje jego rzeczywiste wymiary w pikselach za pomocą Pillow."""
+    """Download image from URL and log its pixel dimensions using Pillow."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         r = requests.get(url, impersonate="chrome", timeout=30)
         if r.status_code != 200:
-            logger.error(f"Nie udało się pobrać obrazu z {url[:80]}... (HTTP {r.status_code})")
+            logger.error(f"Failed to download image from {url[:80]}... (HTTP {r.status_code})")
             return False
 
         with open(output_path, "wb") as f:
@@ -309,18 +309,18 @@ def download_image_and_log_dimensions(url: str, output_path: Path) -> bool:
             with Image.open(output_path) as img:
                 width, height = img.size
             logger.info(
-                f"Zapisano pełnowymiarowy obraz 'images/{output_path.name}': "
-                f"rozdzielczość: {width}x{height} px, rozmiar: {file_size_kb:.1f} KB"
+                f"Saved full-resolution image 'images/{output_path.name}': "
+                f"resolution: {width}x{height} px, size: {file_size_kb:.1f} KB"
             )
         except Exception as e:
             logger.info(
-                f"Zapisano obraz 'images/{output_path.name}' ({file_size_kb:.1f} KB), "
-                f"nie udało się odczytać wymiarów: {e}"
+                f"Saved image 'images/{output_path.name}' ({file_size_kb:.1f} KB), "
+                f"could not read dimensions: {e}"
             )
 
         return True
     except Exception as e:
-        logger.error(f"Błąd podczas zapisu obrazu {output_path.name}: {e}")
+        logger.error(f"Error while saving image {output_path.name}: {e}")
         return False
 
 
@@ -332,13 +332,13 @@ def download_post_media(
     archive_path: Path,
 ) -> bool:
     """
-    Pobiera multimedia dla danego posta w najwyższej dostępnej jakości:
-      - Obrazy zapisywane są do folderu 'images/'.
-      - Wideo zapisywane są do folderu 'videos/'.
-    Dla karuzeli (galerii):
-      - Zapisuje elementy wyłącznie jako {code}_1.ext, {code}_2.ext ... (bez podwójnych kopii).
-    Dla pojedynczych postów:
-      - Zapisuje plik jako {code}.ext w odpowiednim podkatalogu.
+    Download media for given post node in highest available quality:
+      - Images are saved to 'images/' subdirectory.
+      - Videos are saved to 'videos/' subdirectory.
+    For carousels (multi-item galleries):
+      - Items are saved cleanly as {code}_1.ext, {code}_2.ext ... (no duplicates).
+    For single posts:
+      - File is saved as {code}.ext in the corresponding directory.
     """
     code = node["code"]
     media_type = node.get("media_type")  # 1: image, 2: video, 8: carousel
@@ -348,15 +348,15 @@ def download_post_media(
     videos_dir.mkdir(parents=True, exist_ok=True)
     downloaded = False
 
-    # Pobierz dedykowane metadane posta dla maksymalnej jakości
+    # Fetch post metadata for maximum resolution
     post_details = fetch_post_details(code) or node
     carousel_media = post_details.get("carousel_media") or []
 
-    # 1. Obsługa karuzeli (galerii wieloelementowej)
+    # 1. Handle carousel (gallery)
     if len(carousel_media) > 1:
         logger.info(
-            f"Post {code} to karuzela ({len(carousel_media)} elementów). "
-            f"Pobieranie slajdów w pełnej rozdzielczości..."
+            f"Post {code} is a carousel ({len(carousel_media)} items). "
+            f"Downloading slides in full resolution..."
         )
         carousel_success = False
         for idx, item in enumerate(carousel_media, start=1):
@@ -368,7 +368,7 @@ def download_post_media(
                     if download_file(best_video_url, out_file):
                         carousel_success = True
                         file_size_kb = out_file.stat().st_size / 1024
-                        logger.info(f"Zapisano wideo 'videos/{out_file.name}' ({file_size_kb:.1f} KB)")
+                        logger.info(f"Saved video 'videos/{out_file.name}' ({file_size_kb:.1f} KB)")
             else:
                 best_img_url = select_best_image_url(item)
                 if best_img_url:
@@ -381,11 +381,11 @@ def download_post_media(
             with open(archive_path, "a", encoding="utf-8") as f:
                 f.write(f"instagram {code}\n")
 
-    # 2. Obsługa pojedynczego wideo
+    # 2. Handle single video
     is_single_video = not downloaded and (media_type == 2 or bool(post_details.get("video_versions")))
     if is_single_video:
         ffmpeg_path = get_ffmpeg_path()
-        logger.info(f"Pobieranie wideo w maksymalnej jakości przez yt-dlp ({post_url})...")
+        logger.info(f"Downloading video at maximum quality via yt-dlp ({post_url})...")
 
         ydl_opts: Dict[str, Any] = {
             "outtmpl": str(videos_dir / f"{code}.%(ext)s"),
@@ -399,7 +399,7 @@ def download_post_media(
             ydl_opts["ffmpeg_location"] = ffmpeg_path
             ydl_opts["format"] = "bestvideo+bestaudio/best"
         else:
-            logger.warning("Brak ffmpeg w systemie – wybieram zintegrowany format wideo.")
+            logger.warning("No ffmpeg detected on system - falling back to pre-merged video format.")
             ydl_opts["format"] = "b[vcodec!=none][acodec!=none]/best[ext=mp4]/best"
 
         try:
@@ -407,9 +407,9 @@ def download_post_media(
                 ret = ydl.download([post_url])
                 if ret == 0:
                     downloaded = True
-                    logger.info(f"Pomyślnie pobrano wideo 'videos/{code}.mp4'.")
+                    logger.info(f"Successfully downloaded video 'videos/{code}.mp4'.")
         except Exception as e:
-            logger.warning(f"yt-dlp napotkał problem przy {code}: {e}")
+            logger.warning(f"yt-dlp encountered an issue with {code}: {e}")
             try:
                 fallback_opts = {
                     "outtmpl": str(videos_dir / f"{code}.%(ext)s"),
@@ -422,11 +422,11 @@ def download_post_media(
                     ret = ydl.download([post_url])
                     if ret == 0:
                         downloaded = True
-                        logger.info(f"Pomyślnie pobrano wideo {code} za pomocą formatu awaryjnego.")
+                        logger.info(f"Successfully downloaded video {code} using fallback format.")
             except Exception as e2:
-                logger.error(f"Nie udało się pobrać wideo {code} w trybie awaryjnym: {e2}")
+                logger.error(f"Failed to download video {code} in fallback mode: {e2}")
 
-    # 3. Obsługa pojedynczego zdjęcia (lub karuzeli 1-elementowej)
+    # 3. Handle single image (or 1-item carousel)
     if not downloaded:
         item_data = carousel_media[0] if carousel_media else post_details
         best_img_url = select_best_image_url(item_data)
@@ -446,7 +446,7 @@ def watch_profile(
     download_dir: Path = Path("downloads"),
     db_path: Path = Path("downloaded_posts.json"),
 ) -> int:
-    """Monitoruje profil, sprawdza historię i pobiera do N nowych multimediów w podfolderach images/ i videos/."""
+    """Monitor profile, check history, and download up to N new media files into images/ and videos/ subdirectories."""
     username = extract_username(profile_input)
     target_dir = download_dir / username
     images_dir = target_dir / "images"
@@ -457,11 +457,11 @@ def watch_profile(
     videos_dir.mkdir(parents=True, exist_ok=True)
 
     downloaded_ids = load_downloaded_posts(db_path)
-    logger.info(f"Wczytano {len(downloaded_ids)} wcześniej pobranych postów z {db_path}")
+    logger.info(f"Loaded {len(downloaded_ids)} previously downloaded posts from {db_path}")
 
     nodes = fetch_profile_posts(username)
     if not nodes:
-        logger.warning(f"Brak postów do przetworzenia dla profilu '{username}'.")
+        logger.warning(f"No posts found to process for profile '{username}'.")
         return 0
 
     posts_checked = 0
@@ -469,67 +469,67 @@ def watch_profile(
 
     for node in nodes:
         if limit > 0 and posts_downloaded >= limit:
-            logger.info(f"Osiągnięto limit nowo pobranych multimediów ({limit}).")
+            logger.info(f"Reached download limit of new posts ({limit}).")
             break
 
         posts_checked += 1
         code = node["code"]
 
         if code in downloaded_ids:
-            logger.info(f"[{posts_checked}] Post {code} był już pobrany - pomijam.")
+            logger.info(f"[{posts_checked}] Post {code} was already downloaded - skipping.")
             continue
 
-        logger.info(f"[{posts_checked}] Przetwarzanie nowego postu: {code} ...")
+        logger.info(f"[{posts_checked}] Processing new post: {code} ...")
         success = download_post_media(node, username, images_dir, videos_dir, archive_path)
         if success:
             downloaded_ids.add(code)
             save_downloaded_posts(db_path, downloaded_ids)
             posts_downloaded += 1
-            logger.info(f"Pomyślnie zapisano post {code}.")
+            logger.info(f"Successfully saved post {code}.")
         else:
-            logger.warning(f"Nie udało się zapisać multimediów dla postu {code}.")
+            logger.warning(f"Failed to save media for post {code}.")
 
     logger.info(
-        f"Zakończono. Sprawdzono postów: {posts_checked}, nowo pobranych: {posts_downloaded}."
+        f"Completed. Posts checked: {posts_checked}, newly downloaded: {posts_downloaded}."
     )
     return posts_downloaded
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Monitoruj publiczny profil na Instagramie i pobieraj multimedia do podfolderów images/ i videos/."
+        description="Monitor a public Instagram profile and download media into images/ and videos/ subdirectories."
     )
     parser.add_argument(
         "--profile",
         "-p",
         required=True,
         type=str,
-        help="Nazwa profilu lub pełny URL profilu na Instagramie (np. 'nasa' lub 'https://www.instagram.com/nasa/').",
+        help="Instagram profile username or full URL (e.g. 'nasa' or 'https://www.instagram.com/nasa/').",
     )
     parser.add_argument(
         "--limit",
         "-l",
         type=int,
         default=1,
-        help="Liczba najnowszych multimediów do pobrania (domyślnie: 1).",
+        help="Number of latest posts to download (default: 1).",
     )
     parser.add_argument(
         "--download-dir",
         type=str,
         default="downloads",
-        help="Katalog docelowy dla pobranych multimediów (domyślnie: 'downloads').",
+        help="Target directory for downloaded media (default: 'downloads').",
     )
     parser.add_argument(
         "--db-file",
         type=str,
         default="downloaded_posts.json",
-        help="Ścieżka do pliku bazy pobranych postów JSON (domyślnie: 'downloaded_posts.json').",
+        help="Path to JSON file tracking downloaded posts (default: 'downloaded_posts.json').",
     )
 
     args = parser.parse_args()
 
     if args.limit < 1:
-        parser.error("Wartość parametru --limit musi być większa od zera.")
+        parser.error("The --limit value must be greater than zero.")
 
     return args
 

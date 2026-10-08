@@ -1,30 +1,33 @@
 # Instagram Watcher
 
-Narzędzie wiersza poleceń (CLI) w języku Python oparte na bibliotece `yt-dlp`, `curl-cffi` oraz `imageio-ffmpeg`, służące do monitorowania publicznego profilu na Instagramie i automatycznego pobierania nowych postów w maksymalnej dostępnej jakości bez konieczności posiadania konta.
+[English] | [Polski](README.pl.md)
 
-## Struktura katalogów pobierania
-Wszystkie pobierane multimedia są automatycznie kategoryzowane do podkatalogów:
+A robust Python CLI tool built on `yt-dlp`, `curl-cffi`, and `imageio-ffmpeg` to monitor public Instagram profiles and download new posts in maximum available quality without requiring an Instagram account.
+
+## Download Directory Structure
+All downloaded media files are automatically organized into structured subdirectories:
 ```text
-downloads/<nazwa_profilu>/
+downloads/<username>/
 ├── images/
-│   ├── <shortcode>.jpg          # Pojedyncze zdjęcia w pełnej rozdzielczości
-│   ├── <shortcode>_1.jpg        # Slajdy karuzeli/galerii (bez duplikatów)
+│   ├── <shortcode>.jpg          # Single full-resolution photos
+│   ├── <shortcode>_1.jpg        # Carousel/gallery slides (deduplicated)
 │   └── <shortcode>_2.jpg
 ├── videos/
-│   ├── <shortcode>.mp4          # Filmy, Reels (wideo + scalone audio DASH)
-│   └── <shortcode>_1.mp4        # Slajdy wideo wewnątrz karuzeli
-└── archive.txt                  # Archiwum pobrań dla profilu
+│   ├── <shortcode>.mp4          # Videos and Reels (video + merged DASH audio)
+│   └── <shortcode>_1.mp4        # Video slides inside carousels
+└── archive.txt                  # yt-dlp download archive for the profile
 ```
 
-## Dlaczego yt-dlp + curl-cffi + imageio-ffmpeg?
-- **Omijanie blokad 429 i wymuszonego logowania:** Wykorzystanie `curl-cffi` z impersonacją TLS przeglądarki Chrome pozwala na pobieranie danych i metadanych z publicznych profili bez konta na Instagramie.
-- **Maksymalna jakość wideo i audio:** Instagram serwuje najwyższej jakości strumienie wideo i audio oddzielnie (DASH). Dzięki wbudowanemu `imageio-ffmpeg`, `yt-dlp` bezbłędnie scala je w pełnowymiarowy plik `.mp4`.
-- **Maksymalna rozdzielczość grafik:** Skrypt odpytuje dedykowane widoki postów (`/p/<shortcode>/`) i wybiera oryginalne, nieprzeskalowane pliki, weryfikując i logując ich wymiary w pikselach za pomocą biblioteki `Pillow`.
-- **Brak duplikatów:** Slajdy galerii zapisywane są wyłącznie raz jako ponumerowane pliki (`_1`, `_2`...).
+## Key Features & Architecture
+- **Bypass Rate Limits (429) & Login Walls:** Uses `curl-cffi` with Chrome TLS impersonation to fetch data and metadata from public profiles anonymously.
+- **Maximum Video & Audio Quality:** Instagram serves high-quality video and audio streams separately (DASH). With built-in `imageio-ffmpeg`, `yt-dlp` merges them into full-quality `.mp4` files.
+- **Maximum Image Resolution:** Queries dedicated post endpoints (`/p/<shortcode>/`) to fetch original uncompressed assets, inspecting and logging resolution via `Pillow`.
+- **Deduplication:** Carousel slides are cleanly saved once with numeric suffixes (`_1`, `_2`, etc.), preventing duplicated media.
+- **Persistent State Tracking:** Tracks processed posts in `downloaded_posts.json` and `archive.txt` to avoid redundant requests and re-downloads.
 
-## Instalacja
+## Installation
 
-1. Aktywacja środowiska wirtualnego:
+1. Activate your virtual environment:
    - Windows PowerShell:
      ```powershell
      .\venv\Scripts\Activate.ps1
@@ -34,24 +37,29 @@ downloads/<nazwa_profilu>/
      source venv/bin/activate
      ```
 
-2. Instalacja zależności:
+2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-## Użycie
+## Usage
 
-Wyświetlenie pomocy:
+Show help and available options:
 ```powershell
 python instagram_watcher.py --help
 ```
 
-Pobieranie najnowszych materiałów z profilu (np. NASA):
+Download the latest posts from a profile (e.g. `nasa`):
 ```powershell
 python instagram_watcher.py --profile nasa --limit 5
 ```
 
-Użycie z pełnym adresem URL:
+Download using a full URL:
 ```powershell
 python instagram_watcher.py --profile https://www.instagram.com/nasa/ --limit 5
+```
+
+Run test suite:
+```powershell
+pytest
 ```

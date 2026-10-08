@@ -23,18 +23,18 @@ def test_extract_username():
 def test_load_and_save_downloaded_posts(tmp_path: Path):
     db_file = tmp_path / "downloaded_posts.json"
 
-    # Plik jeszcze nie istnieje
+    # File does not exist yet
     assert load_downloaded_posts(db_file) == set()
 
-    # Zapis danych
+    # Save data
     initial_ids = {"post_1", "post_2", "post_3"}
     save_downloaded_posts(db_file, initial_ids)
 
-    # Odczyt danych
+    # Read data
     loaded_ids = load_downloaded_posts(db_file)
     assert loaded_ids == initial_ids
 
-    # Sprawdzenie poprawności formatu JSON
+    # Validate JSON structure
     with open(db_file, "r", encoding="utf-8") as f:
         data = json.load(f)
         assert isinstance(data, list)
