@@ -59,7 +59,35 @@ Download using a full URL:
 python instagram_watcher.py --profile https://www.instagram.com/nasa/ --limit 5
 ```
 
-Run test suite:
+## Important: Unauthenticated Mode & 12-Post Limit
+
+Instagram enforces an aggressive **Login Wall** on public profiles:
+- **Default Mode (No Account Required):** Without logging in, Instagram serves only the initial **12 latest posts** in the public page HTML. Any request for older posts (page 2+) without session credentials is intentionally rejected by Meta (`HTTP 401 / require_login`).
+- **Why this is ideal for a Watcher:** For periodic monitoring (running on a schedule, e.g. daily or weekly), the 12-post limit is completely sufficient. Every newly published post appears at the very top of the grid and will be automatically detected and downloaded in full quality without requiring an account.
+- **Deep Historical Archives (Optional):** If you ever need to download more than 12 historical posts at once from a profile, you can provide session cookies from any burner/dummy account via `--cookies`:
+  ```powershell
+  python instagram_watcher.py --profile nasa --limit 50 --cookies "sessionid=YOUR_SESSIONID"
+  ```
+  or via an exported Netscape cookies file:
+  ```powershell
+  python instagram_watcher.py --profile nasa --limit 50 --cookies cookies.txt
+  ```
+
+## CLI Arguments
+
+| Argument | Description | Default |
+| :--- | :--- | :--- |
+| `--profile`, `-p` | Profile username or full URL (required) | *None* |
+| `--limit`, `-l` | Number of latest new posts to download | `1` |
+| `--download-dir` | Directory where media files are saved | `downloads` |
+| `--db-file` | JSON file storing downloaded post IDs | `downloaded_posts.json` |
+| `--page-delay` | Delay in seconds between pagination requests | `1.5` |
+| `--cookies` | Optional session cookie string or path to `cookies.txt` | *None* |
+
+## Tests
+
+Run the full automated test suite:
 ```powershell
-pytest
+pytest -v
 ```
+

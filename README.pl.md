@@ -57,3 +57,36 @@ Użycie z pełnym adresem URL:
 ```powershell
 python instagram_watcher.py --profile https://www.instagram.com/nasa/ --limit 5
 ```
+
+## Ważne: Działanie bez logowania i limit 12 postów
+
+Instagram stosuje tzw. **Login Wall** dla niezalogowanych użytkowników:
+- **Domyślny tryb bez konta (brak logowania):** W kodzie źródłowym strony profilu Instagram serwuje wyłącznie **12 najnowszych postów**. Każda próba pobrania starszych wpisów (strony 2 i kolejnych) bez poświadczeń sesji jest celowo blokowana przez serwery Meta (`HTTP 401 / require_login`).
+- **Dlaczego to w zupełności wystarcza dla Watchera:** Przy cyklicznym monitorowaniu profilu (np. uruchamianym codziennie lub co kilka dni) limit ten nie stanowi przeszkody. Każdy nowy post pojawia się zawsze na samej górze siatki (wśród pierwszych 12 kafelków) i zostanie automatycznie pobrany w pełnej rozdzielczości bez konieczności logowania czy posiadania konta.
+- **Pobieranie głębokiego archiwum wstecz (opcjonalnie):** Jeśli w przyszłości zechcesz jednorazowo pobrać więcej niż 12 historycznych postów z danego profilu, możesz przekazać ciasteczka sesji (np. z dowolnego darmowego konta testowego / burner) za pomocą parametru `--cookies`:
+  ```powershell
+  python instagram_watcher.py --profile nasa --limit 50 --cookies "sessionid=TWOJ_SESSIONID"
+  ```
+  lub wskazując wyeksportowany plik Netscape cookies:
+  ```powershell
+  python instagram_watcher.py --profile nasa --limit 50 --cookies cookies.txt
+  ```
+
+## Opcje wiersza poleceń
+
+| Parametr | Opis | Wartość domyślna |
+| :--- | :--- | :--- |
+| `--profile`, `-p` | Nazwa użytkownika lub pełny URL profilu (wymagany) | *Brak* |
+| `--limit`, `-l` | Maksymalna liczba nowych postów do pobrania | `1` |
+| `--download-dir` | Folder docelowy dla pobieranych multimediów | `downloads` |
+| `--db-file` | Plik JSON z historią pobranych identyfikatorów | `downloaded_posts.json` |
+| `--page-delay` | Opóźnienie (w sekundach) między kolejnymi stronami | `1.5` |
+| `--cookies` | Opcjonalny token sesji lub ścieżka do pliku `cookies.txt` | *Brak* |
+
+## Testy
+
+Uruchomienie zestawu testów jednostkowych:
+```powershell
+pytest -v
+```
+

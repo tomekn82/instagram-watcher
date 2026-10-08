@@ -5,13 +5,15 @@ Files are categorized into 'images' and 'videos' subdirectories.
 """
 
 import argparse
+import http.cookiejar
 import json
 import logging
+from pathlib import Path
 import re
 import shutil
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from curl_cffi import requests
 from PIL import Image
@@ -94,60 +96,329 @@ def save_downloaded_posts(db_path: Path, downloaded_ids: Set[str]) -> None:
             temp_path.unlink()
 
 
-def fetch_profile_posts(username: str) -> List[Dict[str, Any]]:
-    """Fetch list of recent posts from a public Instagram profile."""
-    url = f"https://www.instagram.com/{username}/"
+def load_cookies_into_session(session: requests.Session, cookies_input: str) -> None:
+    """Load cookies from a Netscape cookiejar file or header string into the session."""
+    raw_input = cookies_input.strip().strip("'\"")
+    cookie_path = Path(raw_input)
+    if cookie_path.is_file():
+        cj = http.cookiejar.MozillaCookieJar(str(cookie_path))
+        try:
+            cj.load(ignore_discard=True, ignore_expires=True)
+            for cookie in cj:
+                session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+            logger.info(f"Loaded cookies from file '{cookie_path}'.")
+            return
+        except Exception as e:
+            logger.warning(f"Could not parse '{cookie_path}' as MozillaCookieJar: {e}. Trying raw string parsing.")
+            try:
+                content = cookie_path.read_text(encoding="utf-8")
+            except Exception:
+                content = ""
+    else:
+        content = raw_input
+
+    # If raw sessionid token was provided directly (no '=' sign)
+    if "=" not in content and len(content) > 10:
+        session.cookies.set("sessionid", content, domain=".instagram.com")
+        logger.info("Loaded sessionid cookie from raw token string.")
+        return
+
+    loaded_count = 0
+    for item in content.split(";"):
+        if "=" in item:
+            k, v = item.strip().split("=", 1)
+            session.cookies.set(k.strip(), v.strip(), domain=".instagram.com")
+            loaded_count += 1
+    if loaded_count > 0:
+        logger.info(f"Loaded {loaded_count} cookie(s) into session.")
+
+
+def find_edges_and_page_info(obj: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Recursively extract post nodes and page_info (end_cursor, has_next_page) from
+    Instagram GraphQL or REST JSON structures.
+    """
+    nodes: List[Dict[str, Any]] = []
+    page_info: Dict[str, Any] = {}
+
+    if isinstance(obj, dict):
+        # 1. Check known timeline connection keys
+        for key in (
+            "polaris_ordered_timeline_connection",
+            "edge_owner_to_timeline_media",
+            "xdt_api__v1__feed__user_timeline_graphql_connection",
+            "xdt_get_owner_to_timeline_media_logged_out",
+        ):
+            if key in obj and isinstance(obj[key], dict):
+                conn = obj[key]
+                if "edges" in conn and isinstance(conn["edges"], list):
+                    for edge in conn["edges"]:
+                        node = edge.get("node") if isinstance(edge, dict) else None
+                        if node and ("code" in node or "shortcode" in node):
+                            if "code" not in node and "shortcode" in node:
+                                node["code"] = node["shortcode"]
+                            nodes.append(node)
+                    if "page_info" in conn and isinstance(conn["page_info"], dict):
+                        page_info = conn["page_info"]
+                    if nodes:
+                        return nodes, page_info
+
+        # 2. Check if dict directly represents a connection with 'edges' and 'page_info'
+        if "edges" in obj and isinstance(obj["edges"], list) and "page_info" in obj:
+            for edge in obj["edges"]:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if node and ("code" in node or "shortcode" in node):
+                    if "code" not in node and "shortcode" in node:
+                        node["code"] = node["shortcode"]
+                    nodes.append(node)
+            pi = obj.get("page_info")
+            if isinstance(pi, dict):
+                page_info = pi
+            if nodes:
+                return nodes, page_info
+
+        # 3. Check REST API format ('items', 'more_available', 'next_max_id')
+        if "items" in obj and isinstance(obj["items"], list):
+            for item in obj["items"]:
+                if isinstance(item, dict) and ("code" in item or "shortcode" in item or "pk" in item):
+                    if "code" not in item and "shortcode" in item:
+                        item["code"] = item["shortcode"]
+                    nodes.append(item)
+            page_info = {
+                "has_next_page": bool(obj.get("more_available", False)),
+                "end_cursor": obj.get("next_max_id"),
+            }
+            if nodes:
+                return nodes, page_info
+
+        # Recurse into dict values
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                sub_nodes, sub_pi = find_edges_and_page_info(v)
+                if sub_nodes:
+                    return sub_nodes, sub_pi
+
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                sub_nodes, sub_pi = find_edges_and_page_info(item)
+                if sub_nodes:
+                    return sub_nodes, sub_pi
+
+    return nodes, page_info
+
+
+def fetch_profile_posts_page_graphql(
+    session: requests.Session,
+    username: str,
+    user_id: Optional[str],
+    end_cursor: str,
+    csrf_token: str,
+    lsd_token: str,
+    app_id: str = "936619743392459",
+    user_pk: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Fetch the next batch of posts using Instagram GraphQL endpoint with cursor pagination.
+    """
+    graphql_url = "https://www.instagram.com/graphql/query/"
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-CSRFToken": csrf_token or session.cookies.get("csrftoken", ""),
+        "X-IG-App-ID": app_id,
+        "X-ASBD-ID": "129477",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://www.instagram.com/{username}/",
+        "Origin": "https://www.instagram.com",
+    }
+    if lsd_token:
+        headers["X-FB-LSD"] = lsd_token
+
+    target_id = user_pk or user_id or username
+
+    # Query variations
+    query_attempts = [
+        (
+            "28142289515441884",
+            "PolarisProfilePostsTabContentQuery_connection",
+            {"after": end_cursor, "first": 12, "username": username},
+        ),
+        (
+            "27389614800735091",
+            "PolarisLoggedOutDesktopWWWProfilePostsTabContentQuery_connection",
+            {"after": end_cursor, "first": 12, "id": target_id},
+        ),
+        (
+            "28816028924680412",
+            "PolarisOwnerToTimelineMediaLoggedOutQuery_connection",
+            {"after": end_cursor, "first": 12, "owner_id": target_id},
+        ),
+        (
+            "27553725110923321",
+            "PolarisLoggedOutDesktopWWWProfilePostsTabContentQuery",
+            {"after": end_cursor, "first": 12, "username": username},
+        ),
+    ]
+
+    auth_blocked = False
+
+    for doc_id, friendly_name, variables in query_attempts:
+        req_headers = dict(headers)
+        req_headers["X-FB-Friendly-Name"] = friendly_name
+        data = {
+            "variables": json.dumps(variables),
+            "doc_id": doc_id,
+        }
+        if lsd_token:
+            data["lsd"] = lsd_token
+
+        try:
+            resp = session.post(graphql_url, data=data, headers=req_headers, impersonate="chrome", timeout=25)
+            if resp.status_code == 401 or (resp.status_code == 200 and '"require_login":true' in resp.text):
+                auth_blocked = True
+            elif resp.status_code == 200:
+                resp_json = resp.json()
+                nodes, page_info = find_edges_and_page_info(resp_json)
+                if nodes:
+                    logger.debug(f"GraphQL query {friendly_name} succeeded with {len(nodes)} nodes.")
+                    return nodes, page_info
+        except Exception as e:
+            logger.debug(f"GraphQL attempt {friendly_name} failed: {e}")
+
+    # Fallback to query_hash GET queries
+    fallback_query_hashes = ["69cba40317214236af40e7efa697781d", "42323d64886122307be10013ad2dcc44"]
+    for qh in fallback_query_hashes:
+        try:
+            vars_json = json.dumps({"id": target_id, "first": 12, "after": end_cursor})
+            get_params = {"query_hash": qh, "variables": vars_json}
+            resp = session.get(graphql_url, params=get_params, headers=headers, impersonate="chrome", timeout=25)
+            if resp.status_code == 401 or (resp.status_code == 200 and '"require_login":true' in resp.text):
+                auth_blocked = True
+            elif resp.status_code == 200:
+                resp_json = resp.json()
+                nodes, page_info = find_edges_and_page_info(resp_json)
+                if nodes:
+                    logger.debug(f"GraphQL query_hash {qh} succeeded with {len(nodes)} nodes.")
+                    return nodes, page_info
+        except Exception as e:
+            logger.debug(f"GraphQL query_hash attempt {qh} failed: {e}")
+
+    # Fallback to REST feed endpoint
+    if target_id:
+        try:
+            rest_url = f"https://www.instagram.com/api/v1/feed/user/{target_id}/"
+            resp = session.get(rest_url, params={"count": 12, "max_id": end_cursor}, headers=headers, impersonate="chrome", timeout=25)
+            if resp.status_code == 401 or '"require_login":true' in resp.text:
+                auth_blocked = True
+            elif resp.status_code == 200:
+                resp_json = resp.json()
+                nodes, page_info = find_edges_and_page_info(resp_json)
+                if nodes:
+                    logger.debug(f"REST feed endpoint succeeded with {len(nodes)} nodes.")
+                    return nodes, page_info
+        except Exception as e:
+            logger.debug(f"REST feed endpoint attempt failed: {e}")
+
+    if auth_blocked or not session.cookies.get("sessionid"):
+        logger.warning(
+            "Instagram zablokowal pobranie kolejnej strony postow (wymagana autoryzacja HTTP 401 / require_login).\n"
+            "   Dla sesji niezalogowanych Instagram ogranicza dostep do pierwszych 12 postow profilu.\n"
+            "   Aby pobrac wiecej postow (ponad 12), przekaz ciasteczka zalogowanej sesji za pomoca parametru:\n"
+            "      --cookies \"sessionid=TWOJ_SESSIONID\"\n"
+            "   lub wskaz plik cookies wyeksportowany z przegladarki:\n"
+            "      --cookies cookies.txt"
+        )
+
+    return [], {}
+
+
+def iterate_profile_posts(
+    username: str,
+    limit: int = 1,
+    page_delay: float = 1.5,
+    session: Optional[requests.Session] = None,
+    cookies_path: Optional[str] = None,
+) -> Iterator[Dict[str, Any]]:
+    """
+    Generator yielding post nodes from a public Instagram profile page by page.
+    Handles cursor pagination (end_cursor / has_next_page) via GraphQL queries.
+    Introduces a configurable delay between page requests to avoid rate limits.
+    """
+    if session is None:
+        session = requests.Session()
+    if cookies_path:
+        load_cookies_into_session(session, cookies_path)
+
+    profile_url = f"https://www.instagram.com/{username}/"
     headers = {
         "Accept-Language": "en-US,en;q=0.9",
     }
-    logger.info(f"Fetching profile timeline: {url} ...")
+    logger.info(f"Fetching profile timeline: {profile_url} ...")
     try:
-        response = requests.get(url, impersonate="chrome", headers=headers, timeout=25)
+        response = session.get(profile_url, impersonate="chrome", headers=headers, timeout=25)
     except Exception as e:
         logger.error(f"Connection error while fetching Instagram profile: {e}")
-        return []
+        return
 
     if response.status_code == 404:
         logger.error(f"Profile '{username}' does not exist (HTTP 404).")
-        return []
+        return
     elif response.status_code != 200:
         logger.error(f"Instagram returned HTTP {response.status_code}.")
-        return []
+        return
 
     html = response.text
     scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", html, re.DOTALL)
 
-    def find_edges(obj: Any) -> Optional[List[Dict[str, Any]]]:
-        if isinstance(obj, dict):
-            if (
-                "polaris_ordered_timeline_connection" in obj
-                and "edges" in obj["polaris_ordered_timeline_connection"]
-            ):
-                return obj["polaris_ordered_timeline_connection"]["edges"]
-            for v in obj.values():
-                res = find_edges(v)
-                if res is not None:
-                    return res
-        elif isinstance(obj, list):
-            for item in obj:
-                res = find_edges(item)
-                if res is not None:
-                    return res
-        return None
-
     nodes: List[Dict[str, Any]] = []
+    page_info: Dict[str, Any] = {}
+    user_id: Optional[str] = None
+    user_pk: Optional[str] = None
+
+    # Search for user pk using regex directly from profile html
+    pk_match = (
+        re.search(r'"user":\{"pk":"(\d+)"[^}]*"username":"' + re.escape(username) + r'"', html)
+        or re.search(r'"pk":"(\d+)"[^}]*"username":"' + re.escape(username) + r'"', html)
+        or re.search(r'"username":"' + re.escape(username) + r'"[^}]*"pk":"(\d+)"', html)
+    )
+    if pk_match:
+        user_pk = pk_match.group(1)
+
     for s in scripts:
-        if "polaris_ordered_timeline_connection" in s:
+        if "polaris_ordered_timeline_connection" in s or "xig_user_by_username" in s:
             try:
                 data = json.loads(s)
-                edges = find_edges(data)
-                if edges:
-                    for e in edges:
-                        node = e.get("node")
-                        if node and "code" in node:
-                            nodes.append(node)
-                    if nodes:
-                        break
+                found_nodes, found_pi = find_edges_and_page_info(data)
+                if found_nodes:
+                    nodes = found_nodes
+                    page_info = found_pi
+
+                    def find_user_ids(obj: Any) -> Tuple[Optional[str], Optional[str]]:
+                        if isinstance(obj, dict):
+                            if "xig_user_by_username" in obj and isinstance(obj["xig_user_by_username"], dict):
+                                u = obj["xig_user_by_username"]
+                                return u.get("pk"), u.get("id")
+                            if "pk" in obj and "polaris_ordered_timeline_connection" in obj:
+                                return obj.get("pk"), obj.get("id")
+                            for v in obj.values():
+                                p, i = find_user_ids(v)
+                                if p or i:
+                                    return p, i
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                p, i = find_user_ids(item)
+                                if p or i:
+                                    return p, i
+                        return None, None
+
+                    found_pk, found_id = find_user_ids(data)
+                    if found_pk:
+                        user_pk = str(found_pk)
+                    if found_id:
+                        user_id = str(found_id)
+                    break
             except Exception:
                 pass
 
@@ -162,11 +433,119 @@ def fetch_profile_posts(username: str) -> List[Dict[str, Any]]:
         for c in found_codes:
             nodes.append({"code": c, "media_type": 1})
 
-    logger.info(f"Discovered {len(nodes)} posts on profile '{username}'.")
-    return nodes
+    # If no nodes discovered, try yt-dlp playlist extraction fallback
+    if not nodes:
+        logger.debug("Attempting fallback post discovery via yt-dlp...")
+        try:
+            ydl_opts = {
+                "extract_flat": True,
+                "playlistend": limit if limit > 0 else None,
+                "quiet": True,
+                "no_warnings": True,
+            }
+            if cookies_path and Path(cookies_path).is_file():
+                ydl_opts["cookiefile"] = str(cookies_path)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(profile_url, download=False)
+                if info and "entries" in info:
+                    for entry in info["entries"]:
+                        if entry and "id" in entry:
+                            nodes.append({"code": entry["id"], "media_type": 1})
+        except Exception as e:
+            logger.debug(f"yt-dlp fallback extraction not available: {e}")
+
+    logger.info(f"Page 1: discovered {len(nodes)} posts on profile '{username}'.")
+
+    csrf_token = session.cookies.get("csrftoken", "")
+    lsd_match = re.search(r'"LSD",\[\],\{"token":"([^"]+)"\}', html)
+    lsd_token = lsd_match.group(1) if lsd_match else ""
+    app_id_match = re.search(r'"appId":"(\d+)"', html) or re.search(r'"APP_ID":"(\d+)"', html)
+    app_id = app_id_match.group(1) if app_id_match else "936619743392459"
+
+    yielded_count = 0
+    seen_codes: Set[str] = set()
+
+    for node in nodes:
+        code = node.get("code") or node.get("shortcode")
+        if code and code not in seen_codes:
+            seen_codes.add(code)
+            yield node
+            yielded_count += 1
+            if limit > 0 and yielded_count >= limit:
+                return
+
+    has_next_page = bool(page_info.get("has_next_page", False))
+    end_cursor = page_info.get("end_cursor")
+
+    page_num = 1
+    while has_next_page and end_cursor:
+        if limit > 0 and yielded_count >= limit:
+            break
+
+        page_num += 1
+        if page_delay > 0:
+            logger.info(f"Waiting {page_delay:.1f}s before fetching page {page_num} to avoid rate-limiting...")
+            time.sleep(page_delay)
+
+        logger.info(f"Fetching page {page_num} of posts via GraphQL (cursor: {end_cursor[:20]}...)...")
+        next_nodes, next_page_info = fetch_profile_posts_page_graphql(
+            session=session,
+            username=username,
+            user_id=user_id,
+            end_cursor=end_cursor,
+            csrf_token=csrf_token,
+            lsd_token=lsd_token,
+            app_id=app_id,
+            user_pk=user_pk,
+        )
+
+        if not next_nodes:
+            if not session.cookies.get("sessionid"):
+                logger.info("Zakonczono pobieranie dostepnej siatki profilu (maksymalny limit 12 postow dla sesji bez logowania).")
+            else:
+                logger.info(f"Brak kolejnych postow na stronie {page_num} (koniec osi czasu).")
+            break
+
+        logger.info(f"Page {page_num}: retrieved {len(next_nodes)} posts.")
+        for node in next_nodes:
+            code = node.get("code") or node.get("shortcode")
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                yield node
+                yielded_count += 1
+                if limit > 0 and yielded_count >= limit:
+                    return
+
+        has_next_page = bool(next_page_info.get("has_next_page", False))
+        end_cursor = next_page_info.get("end_cursor")
+        if not has_next_page or not end_cursor:
+            logger.info("Reached the end of posts on the profile (has_next_page == False).")
+            break
 
 
-def fetch_post_details(shortcode: str) -> Optional[Dict[str, Any]]:
+def fetch_profile_posts(
+    username: str,
+    limit: int = 12,
+    page_delay: float = 1.5,
+    session: Optional[requests.Session] = None,
+    cookies_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch list of posts from a public Instagram profile (up to limit)."""
+    posts = []
+    for node in iterate_profile_posts(
+        username=username,
+        limit=limit,
+        page_delay=page_delay,
+        session=session,
+        cookies_path=cookies_path,
+    ):
+        posts.append(node)
+        if limit > 0 and len(posts) >= limit:
+            break
+    return posts
+
+
+def fetch_post_details(shortcode: str, session: Optional[requests.Session] = None) -> Optional[Dict[str, Any]]:
     """
     Fetch full post metadata from dedicated view https://www.instagram.com/p/<shortcode>/
     to retrieve highest resolution media formats (image_versions2, display_resources, carousel_media).
@@ -176,8 +555,9 @@ def fetch_post_details(shortcode: str) -> Optional[Dict[str, Any]]:
         "Accept-Language": "en-US,en;q=0.9",
     }
     logger.info(f"Fetching detailed metadata from post view: {post_url} ...")
+    client = session if session is not None else requests
     try:
-        response = requests.get(post_url, impersonate="chrome", headers=headers, timeout=25)
+        response = client.get(post_url, impersonate="chrome", headers=headers, timeout=25)
     except Exception as e:
         logger.warning(f"Connection error while fetching post view for {shortcode}: {e}")
         return None
@@ -330,6 +710,8 @@ def download_post_media(
     images_dir: Path,
     videos_dir: Path,
     archive_path: Path,
+    session: Optional[requests.Session] = None,
+    cookies_path: Optional[str] = None,
 ) -> bool:
     """
     Download media for given post node in highest available quality:
@@ -340,8 +722,25 @@ def download_post_media(
     For single posts:
       - File is saved as {code}.ext in the corresponding directory.
     """
-    code = node["code"]
-    media_type = node.get("media_type")  # 1: image, 2: video, 8: carousel
+    code = node.get("code") or node.get("shortcode")
+    if not code:
+        return False
+    node["code"] = code
+
+    # Normalize media type and carousel items from legacy or modern schema
+    if "carousel_media" not in node and "edge_sidecar_to_children" in node:
+        edges = node.get("edge_sidecar_to_children", {}).get("edges", [])
+        node["carousel_media"] = [e.get("node") for e in edges if e.get("node")]
+
+    media_type = node.get("media_type")
+    if media_type is None:
+        if node.get("is_video") or node.get("video_versions"):
+            media_type = 2
+        elif node.get("carousel_media"):
+            media_type = 8
+        else:
+            media_type = 1
+
     post_url = f"https://www.instagram.com/p/{code}/"
 
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -349,7 +748,7 @@ def download_post_media(
     downloaded = False
 
     # Fetch post metadata for maximum resolution
-    post_details = fetch_post_details(code) or node
+    post_details = fetch_post_details(code, session=session) or node
     carousel_media = post_details.get("carousel_media") or []
 
     # 1. Handle carousel (gallery)
@@ -395,6 +794,9 @@ def download_post_media(
             "no_warnings": True,
         }
 
+        if cookies_path and Path(cookies_path).is_file():
+            ydl_opts["cookiefile"] = str(cookies_path)
+
         if ffmpeg_path:
             ydl_opts["ffmpeg_location"] = ffmpeg_path
             ydl_opts["format"] = "bestvideo+bestaudio/best"
@@ -418,6 +820,8 @@ def download_post_media(
                     "quiet": True,
                     "no_warnings": True,
                 }
+                if cookies_path and Path(cookies_path).is_file():
+                    fallback_opts["cookiefile"] = str(cookies_path)
                 with yt_dlp.YoutubeDL(fallback_opts) as ydl:
                     ret = ydl.download([post_url])
                     if ret == 0:
@@ -445,8 +849,14 @@ def watch_profile(
     limit: int = 1,
     download_dir: Path = Path("downloads"),
     db_path: Path = Path("downloaded_posts.json"),
+    page_delay: float = 1.5,
+    cookies_path: Optional[str] = None,
 ) -> int:
-    """Monitor profile, check history, and download up to N new media files into images/ and videos/ subdirectories."""
+    """
+    Monitor profile, check history, and download up to N new media files into images/ and videos/ subdirectories.
+    Paginates across multiple pages until limit is reached, a previously downloaded post is encountered,
+    or the profile has no more posts.
+    """
     username = extract_username(profile_input)
     target_dir = download_dir / username
     images_dir = target_dir / "images"
@@ -459,28 +869,58 @@ def watch_profile(
     downloaded_ids = load_downloaded_posts(db_path)
     logger.info(f"Loaded {len(downloaded_ids)} previously downloaded posts from {db_path}")
 
-    nodes = fetch_profile_posts(username)
-    if not nodes:
-        logger.warning(f"No posts found to process for profile '{username}'.")
-        return 0
+    session = requests.Session()
+    effective_cookiefile = cookies_path if (cookies_path and Path(cookies_path).is_file()) else None
+    if cookies_path:
+        load_cookies_into_session(session, cookies_path)
+        if not effective_cookiefile:
+            try:
+                temp_cf = target_dir / "cookies.txt"
+                with open(temp_cf, "w", encoding="utf-8") as f:
+                    f.write("# Netscape HTTP Cookie File\n")
+                    for name, value in session.cookies.items():
+                        f.write(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\t{name}\t{value}\n")
+                effective_cookiefile = str(temp_cf)
+            except Exception as e:
+                logger.debug(f"Could not generate cookiefile for yt-dlp: {e}")
 
     posts_checked = 0
     posts_downloaded = 0
 
-    for node in nodes:
+    for node in iterate_profile_posts(
+        username=username,
+        limit=0,
+        page_delay=page_delay,
+        session=session,
+        cookies_path=cookies_path,
+    ):
         if limit > 0 and posts_downloaded >= limit:
             logger.info(f"Reached download limit of new posts ({limit}).")
             break
 
         posts_checked += 1
-        code = node["code"]
-
-        if code in downloaded_ids:
-            logger.info(f"[{posts_checked}] Post {code} was already downloaded - skipping.")
+        code = node.get("code") or node.get("shortcode")
+        if not code:
             continue
 
+        # Stop if post was already downloaded (since checking from newest to oldest)
+        if code in downloaded_ids:
+            logger.info(
+                f"[{posts_checked}] Post {code} was already downloaded. "
+                f"Reached previously processed posts - stopping search."
+            )
+            break
+
         logger.info(f"[{posts_checked}] Processing new post: {code} ...")
-        success = download_post_media(node, username, images_dir, videos_dir, archive_path)
+        success = download_post_media(
+            node=node,
+            profile_name=username,
+            images_dir=images_dir,
+            videos_dir=videos_dir,
+            archive_path=archive_path,
+            session=session,
+            cookies_path=effective_cookiefile,
+        )
         if success:
             downloaded_ids.add(code)
             save_downloaded_posts(db_path, downloaded_ids)
@@ -488,6 +928,10 @@ def watch_profile(
             logger.info(f"Successfully saved post {code}.")
         else:
             logger.warning(f"Failed to save media for post {code}.")
+
+        if limit > 0 and posts_downloaded >= limit:
+            logger.info(f"Reached download limit of new posts ({limit}).")
+            break
 
     logger.info(
         f"Completed. Posts checked: {posts_checked}, newly downloaded: {posts_downloaded}."
@@ -525,6 +969,18 @@ def parse_args() -> argparse.Namespace:
         default="downloaded_posts.json",
         help="Path to JSON file tracking downloaded posts (default: 'downloaded_posts.json').",
     )
+    parser.add_argument(
+        "--page-delay",
+        type=float,
+        default=1.5,
+        help="Delay in seconds between fetching pagination pages (default: 1.5).",
+    )
+    parser.add_argument(
+        "--cookies",
+        type=str,
+        default=None,
+        help="Path to cookies file (Netscape format) or cookies string for authentication.",
+    )
 
     args = parser.parse_args()
 
@@ -541,6 +997,8 @@ def main():
         limit=args.limit,
         download_dir=Path(args.download_dir),
         db_path=Path(args.db_file),
+        page_delay=args.page_delay,
+        cookies_path=args.cookies,
     )
 
 
