@@ -345,3 +345,47 @@ def test_fetch_profile_posts_wrapper(monkeypatch):
     assert len(posts) == 4
     assert [p["code"] for p in posts] == ["post_1", "post_2", "post_3", "post_4"]
 
+
+def test_iterate_profile_posts_authenticated(monkeypatch):
+    # Simulated logged-in HTML (no timeline scripts)
+    mock_html = '<html><head><script>["DTSGInitialData",[],{"token":"dtsg_token_123"}]</script></head><body></body></html>'
+
+    mock_session = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = mock_html
+    mock_session.get.return_value = mock_resp
+    mock_session.cookies = {"sessionid": "valid_session", "csrftoken": "valid_csrf", "ds_user_id": "999"}
+
+    page1_nodes = [{"code": f"auth_p1_{i}", "media_type": 1, "user": {"pk": "999"}} for i in range(1, 13)]
+    page1_info = {"has_next_page": True, "end_cursor": "cursor_auth_1"}
+
+    page2_nodes = [{"code": f"auth_p2_{i}", "media_type": 1} for i in range(1, 6)]
+    page2_info = {"has_next_page": False, "end_cursor": None}
+
+    def mock_fetch_page(*args, **kwargs):
+        cursor = kwargs.get("end_cursor", "")
+        if not cursor:
+            return page1_nodes, page1_info
+        elif cursor == "cursor_auth_1":
+            return page2_nodes, page2_info
+        return [], {}
+
+    monkeypatch.setattr("instagram_watcher.fetch_profile_posts_page_graphql", mock_fetch_page)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    posts = list(
+        iterate_profile_posts(
+            username="testuser",
+            limit=15,
+            session=mock_session,
+        )
+    )
+
+    assert len(posts) == 15
+    assert posts[0]["code"] == "auth_p1_1"
+    assert posts[11]["code"] == "auth_p1_12"
+    assert posts[12]["code"] == "auth_p2_1"
+    assert posts[14]["code"] == "auth_p2_3"
+
+

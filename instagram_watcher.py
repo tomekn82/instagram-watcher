@@ -1,6 +1,7 @@
 """
-Instagram Watcher - CLI tool powered by yt-dlp and curl-cffi to monitor
-a public Instagram profile and download media in maximum available quality.
+Instagram Watcher - CLI tool powered by yt-dlp, curl-cffi, and imageio-ffmpeg to monitor
+Instagram profiles and download media in maximum available quality.
+Supports anonymous mode (up to 12 posts) and authenticated mode (cookies) for deep pagination.
 Files are categorized into 'images' and 'videos' subdirectories.
 """
 
@@ -217,17 +218,97 @@ def fetch_profile_posts_page_graphql(
     lsd_token: str,
     app_id: str = "936619743392459",
     user_pk: Optional[str] = None,
+    fb_dtsg: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch the next batch of posts using Instagram GraphQL endpoint with cursor pagination.
+    Supports both logged-in sessions (Relay doc_id 8363144743749214) and public/logged-out fallback queries.
     """
-    graphql_url = "https://www.instagram.com/graphql/query/"
+    graphql_url = "https://www.instagram.com/graphql/query"
+    target_id = user_pk or user_id or username
+    resolved_csrf = csrf_token or session.cookies.get("csrftoken", "")
+    resolved_app_id = app_id or "936619743392459"
+
+    # 1. Authenticated session query (PolarisProfilePostsTabContentQuery_connection)
+    if session.cookies.get("sessionid"):
+        auth_variables: Dict[str, Any] = {
+            "username": username,
+            "__relay_internal__pv__PolarisIsLoggedInrelayprovider": True,
+            "__relay_internal__pv__PolarisFeedShareMenurelayprovider": True,
+            "data": {
+                "count": 12,
+                "include_relationship_info": True,
+                "latest_besties_reel_media": True,
+                "latest_reel_media": True,
+            },
+        }
+        if end_cursor:
+            auth_variables["after"] = end_cursor
+            auth_variables["before"] = None
+            auth_variables["first"] = 12
+            auth_variables["last"] = None
+
+        auth_headers = {
+            "x-fb-friendly-name": "PolarisProfilePostsTabContentQuery_connection",
+            "x-csrftoken": resolved_csrf,
+            "x-ig-app-id": resolved_app_id,
+            "x-fb-lsd": lsd_token or "",
+            "x-asbd-id": "129477",
+            "Referer": f"https://www.instagram.com/{username}/",
+            "Origin": "https://www.instagram.com",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "*/*",
+        }
+
+        user_id_val = session.cookies.get("ds_user_id", "0")
+        auth_body = {
+            "av": user_id_val,
+            "__d": "www",
+            "__user": "0",
+            "__a": "1",
+            "__req": "x",
+            "dpr": "1",
+            "__comet_req": "7",
+            "fb_dtsg": fb_dtsg or "",
+            "lsd": lsd_token or "",
+            "fb_api_caller_class": "RelayModern",
+            "fb_api_req_friendly_name": "PolarisProfilePostsTabContentQuery_connection",
+            "variables": json.dumps(auth_variables),
+            "server_timestamps": "true",
+            "doc_id": "8363144743749214",
+        }
+
+        try:
+            resp = session.post(
+                graphql_url,
+                data=auth_body,
+                headers=auth_headers,
+                impersonate="chrome",
+                timeout=25,
+            )
+            if resp.status_code == 200:
+                resp_json = resp.json()
+                conn = resp_json.get("data", {}).get("xdt_api__v1__feed__user_timeline_graphql_connection")
+                if conn:
+                    edges = conn.get("edges", [])
+                    nodes = [e.get("node") for e in edges if e.get("node")]
+                    page_info = conn.get("page_info", {})
+                    if nodes:
+                        logger.debug(f"Authenticated GraphQL query succeeded with {len(nodes)} nodes.")
+                        return nodes, page_info
+                nodes, page_info = find_edges_and_page_info(resp_json)
+                if nodes:
+                    logger.debug(f"Authenticated GraphQL query helper succeeded with {len(nodes)} nodes.")
+                    return nodes, page_info
+        except Exception as e:
+            logger.debug(f"Authenticated GraphQL attempt failed: {e}")
+
     headers = {
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "application/x-www-form-urlencoded",
-        "X-CSRFToken": csrf_token or session.cookies.get("csrftoken", ""),
-        "X-IG-App-ID": app_id,
+        "X-CSRFToken": resolved_csrf,
+        "X-IG-App-ID": resolved_app_id,
         "X-ASBD-ID": "129477",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"https://www.instagram.com/{username}/",
@@ -236,9 +317,7 @@ def fetch_profile_posts_page_graphql(
     if lsd_token:
         headers["X-FB-LSD"] = lsd_token
 
-    target_id = user_pk or user_id or username
-
-    # Query variations
+    # Query variations for public/logged-out fallback
     query_attempts = [
         (
             "28142289515441884",
@@ -342,8 +421,8 @@ def iterate_profile_posts(
     cookies_path: Optional[str] = None,
 ) -> Iterator[Dict[str, Any]]:
     """
-    Generator yielding post nodes from a public Instagram profile page by page.
-    Handles cursor pagination (end_cursor / has_next_page) via GraphQL queries.
+    Generator yielding post nodes from an Instagram profile page by page.
+    Supports both anonymous mode (up to 12 posts) and authenticated mode (cookies with cursor pagination).
     Introduces a configurable delay between page requests to avoid rate limits.
     """
     if session is None:
@@ -422,6 +501,30 @@ def iterate_profile_posts(
             except Exception:
                 pass
 
+    # Extract tokens for GraphQL queries
+    csrf_token = session.cookies.get("csrftoken", "")
+    lsd_match = re.search(r'\["LSD",\s*\[\],\s*\{"token":\s*"([^"]+)"\}', html) or re.search(r'"LSD",\[\],\{"token":"([^"]+)"\}', html)
+    lsd_token = lsd_match.group(1) if lsd_match else ""
+    app_id_match = re.search(r'"appId":"(\d+)"', html) or re.search(r'"APP_ID":"(\d+)"', html)
+    app_id = app_id_match.group(1) if app_id_match else "936619743392459"
+    dtsg_match = re.search(r'DTSGInitialData.*?token["\']?\s*:\s*["\']([^"\']+)["\']', html) or re.search(r'"DTSGInitData",\[\],\{"token":"([^"]+)"\}', html)
+    fb_dtsg = dtsg_match.group(1) if dtsg_match else ""
+
+    # If no nodes discovered in HTML scripts (e.g. for authenticated sessions), fetch Page 1 via GraphQL
+    if not nodes and (session.cookies.get("sessionid") or fb_dtsg):
+        logger.debug("Logged-in session detected: fetching Page 1 posts via GraphQL...")
+        nodes, page_info = fetch_profile_posts_page_graphql(
+            session=session,
+            username=username,
+            user_id=user_id,
+            end_cursor="",
+            csrf_token=csrf_token,
+            lsd_token=lsd_token,
+            app_id=app_id,
+            user_pk=user_pk,
+            fb_dtsg=fb_dtsg,
+        )
+
     if not nodes:
         logger.debug("Falling back to regex extraction for post codes...")
         found_codes: List[str] = []
@@ -454,13 +557,12 @@ def iterate_profile_posts(
         except Exception as e:
             logger.debug(f"yt-dlp fallback extraction not available: {e}")
 
-    logger.info(f"Page 1: discovered {len(nodes)} posts on profile '{username}'.")
+    if nodes and not user_pk:
+        first_user = nodes[0].get("user") or {}
+        if first_user.get("pk"):
+            user_pk = str(first_user["pk"])
 
-    csrf_token = session.cookies.get("csrftoken", "")
-    lsd_match = re.search(r'"LSD",\[\],\{"token":"([^"]+)"\}', html)
-    lsd_token = lsd_match.group(1) if lsd_match else ""
-    app_id_match = re.search(r'"appId":"(\d+)"', html) or re.search(r'"APP_ID":"(\d+)"', html)
-    app_id = app_id_match.group(1) if app_id_match else "936619743392459"
+    logger.info(f"Page 1: discovered {len(nodes)} posts on profile '{username}'.")
 
     yielded_count = 0
     seen_codes: Set[str] = set()
@@ -497,6 +599,7 @@ def iterate_profile_posts(
             lsd_token=lsd_token,
             app_id=app_id,
             user_pk=user_pk,
+            fb_dtsg=fb_dtsg,
         )
 
         if not next_nodes:
@@ -591,6 +694,34 @@ def fetch_post_details(shortcode: str, session: Optional[requests.Session] = Non
                 media = find_media(data)
                 if media and "if_not_gated_logged_out" in media:
                     return media["if_not_gated_logged_out"]
+                elif media:
+                    return media
+            except Exception:
+                pass
+        elif "image_versions2" in s or "video_versions" in s:
+            try:
+                data = json.loads(s)
+
+                def find_media_node(obj: Any) -> Optional[Dict[str, Any]]:
+                    if isinstance(obj, dict):
+                        if (obj.get("code") == shortcode or obj.get("shortcode") == shortcode) and (
+                            "image_versions2" in obj or "video_versions" in obj or "carousel_media" in obj
+                        ):
+                            return obj
+                        for v in obj.values():
+                            res = find_media_node(v)
+                            if res is not None:
+                                return res
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            res = find_media_node(item)
+                            if res is not None:
+                                return res
+                    return None
+
+                m = find_media_node(data)
+                if m:
+                    return m
             except Exception:
                 pass
 
@@ -855,7 +986,7 @@ def watch_profile(
     """
     Monitor profile, check history, and download up to N new media files into images/ and videos/ subdirectories.
     Paginates across multiple pages until limit is reached, a previously downloaded post is encountered,
-    or the profile has no more posts.
+    or the profile has no more posts. Supports both unauthenticated (up to 12 posts) and authenticated modes.
     """
     username = extract_username(profile_input)
     target_dir = download_dir / username
@@ -941,7 +1072,7 @@ def watch_profile(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Monitor a public Instagram profile and download media into images/ and videos/ subdirectories."
+        description="Monitor an Instagram profile and download media into images/ and videos/ subdirectories. Supports anonymous mode (up to 12 posts) and authenticated mode via --cookies for deep pagination."
     )
     parser.add_argument(
         "--profile",
