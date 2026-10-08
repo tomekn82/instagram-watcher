@@ -1,0 +1,22 @@
+# Środowisko wirtualne
+venv/
+.env
+
+# Pobrane pliki i baza pobrań
+downloads/
+downloaded_posts.json
+
+# Pamięć podręczna Pythona i testów
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Pliki tymczasowe i pobierania
+*.tmp
+*.part
+*.log
+
+# Środowiska IDE
+.vscode/
+.idea/
