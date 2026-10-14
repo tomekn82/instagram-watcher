@@ -20,3 +20,6 @@ __pycache__/
 # Środowiska IDE
 .vscode/
 .idea/
+
+cookies.txt
+*.txt

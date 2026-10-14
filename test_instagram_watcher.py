@@ -8,6 +8,7 @@ from instagram_watcher import (
     extract_username,
     fetch_profile_posts,
     find_edges_and_page_info,
+    is_post_pinned,
     iterate_profile_posts,
     load_cookies_into_session,
     load_downloaded_posts,
@@ -275,14 +276,24 @@ def test_watch_profile_termination_on_limit(monkeypatch, tmp_path: Path):
     assert saved_ids == {"post_1", "post_2", "post_3"}
 
 
+def test_is_post_pinned():
+    assert is_post_pinned({"timeline_pinned_user_ids": ["12345"]}) is True
+    assert is_post_pinned({"timeline_pinned_user_ids": []}) is False
+    assert is_post_pinned({"is_pinned": True}) is True
+    assert is_post_pinned({"is_pinned": False}) is False
+    assert is_post_pinned({"pinned_for_users": ["user1"]}) is True
+    assert is_post_pinned({"pinned_for_users": []}) is False
+    assert is_post_pinned({}) is False
+
+
 def test_watch_profile_termination_on_downloaded_posts(monkeypatch, tmp_path: Path):
     db_file = tmp_path / "downloaded_posts.json"
     download_dir = tmp_path / "downloads"
 
-    # Pre-populate database with post_3
-    save_downloaded_posts(db_file, {"post_3"})
+    # Pre-populate database with 4 consecutive posts: post_3, post_4, post_5, post_6
+    save_downloaded_posts(db_file, {"post_3", "post_4", "post_5", "post_6"})
 
-    mock_nodes = [{"code": f"post_{i}"} for i in range(1, 6)]
+    mock_nodes = [{"code": f"post_{i}"} for i in range(1, 10)]
     downloaded_calls = []
 
     monkeypatch.setattr(
@@ -301,11 +312,130 @@ def test_watch_profile_termination_on_downloaded_posts(monkeypatch, tmp_path: Pa
         db_path=db_file,
     )
 
-    # Must only download post_1 and post_2; stops on post_3
+    # Must download post_1 and post_2, then break on post_6 (4 consecutive existing: 3, 4, 5, 6)
     assert downloaded == 2
     assert downloaded_calls == ["post_1", "post_2"]
     saved_ids = load_downloaded_posts(db_file)
-    assert saved_ids == {"post_1", "post_2", "post_3"}
+    assert saved_ids == {"post_1", "post_2", "post_3", "post_4", "post_5", "post_6"}
+
+
+def test_watch_profile_pinned_posts_continue(monkeypatch, tmp_path: Path):
+    db_file = tmp_path / "downloaded_posts.json"
+    download_dir = tmp_path / "downloads"
+
+    # Pinned posts that were previously downloaded
+    save_downloaded_posts(db_file, {"pin_1", "pin_2", "post_3", "post_4", "post_5", "post_6"})
+
+    mock_nodes = [
+        {"code": "pin_1", "timeline_pinned_user_ids": ["999"]},
+        {"code": "pin_2", "is_pinned": True},
+        {"code": "post_1"},  # New
+        {"code": "post_2"},  # New
+        {"code": "post_3"},  # Existing 1
+        {"code": "post_4"},  # Existing 2
+        {"code": "post_5"},  # Existing 3
+        {"code": "post_6"},  # Existing 4 -> break!
+        {"code": "post_7"},  # Should not be reached
+    ]
+    downloaded_calls = []
+
+    monkeypatch.setattr(
+        "instagram_watcher.iterate_profile_posts",
+        lambda *args, **kwargs: iter(mock_nodes),
+    )
+    monkeypatch.setattr(
+        "instagram_watcher.download_post_media",
+        lambda **kwargs: downloaded_calls.append(kwargs["node"]["code"]) or True,
+    )
+
+    downloaded = watch_profile(
+        profile_input="nasa",
+        limit=10,
+        download_dir=download_dir,
+        db_path=db_file,
+    )
+
+    # Skips pin_1 and pin_2 via continue, downloads post_1 and post_2, stops on post_6
+    assert downloaded == 2
+    assert downloaded_calls == ["post_1", "post_2"]
+
+
+def test_watch_profile_consecutive_counter_resets_on_new_post(monkeypatch, tmp_path: Path):
+    db_file = tmp_path / "downloaded_posts.json"
+    download_dir = tmp_path / "downloads"
+
+    save_downloaded_posts(db_file, {"post_1", "post_2", "post_4", "post_5", "post_6", "post_7"})
+
+    mock_nodes = [
+        {"code": "post_1"},  # Existing 1
+        {"code": "post_2"},  # Existing 2
+        {"code": "post_3"},  # NEW! Counter resets to 0
+        {"code": "post_4"},  # Existing 1
+        {"code": "post_5"},  # Existing 2
+        {"code": "post_6"},  # Existing 3
+        {"code": "post_7"},  # Existing 4 -> break!
+        {"code": "post_8"},  # Should not be reached
+    ]
+    downloaded_calls = []
+
+    monkeypatch.setattr(
+        "instagram_watcher.iterate_profile_posts",
+        lambda *args, **kwargs: iter(mock_nodes),
+    )
+    monkeypatch.setattr(
+        "instagram_watcher.download_post_media",
+        lambda **kwargs: downloaded_calls.append(kwargs["node"]["code"]) or True,
+    )
+
+    downloaded = watch_profile(
+        profile_input="nasa",
+        limit=10,
+        download_dir=download_dir,
+        db_path=db_file,
+    )
+
+    assert downloaded == 1
+    assert downloaded_calls == ["post_3"]
+
+
+def test_watch_profile_no_early_stop(monkeypatch, tmp_path: Path):
+    db_file = tmp_path / "downloaded_posts.json"
+    download_dir = tmp_path / "downloads"
+
+    # 5 consecutive existing posts
+    save_downloaded_posts(db_file, {"post_1", "post_2", "post_3", "post_4", "post_5"})
+
+    mock_nodes = [
+        {"code": "post_1"},
+        {"code": "post_2"},
+        {"code": "post_3"},
+        {"code": "post_4"},
+        {"code": "post_5"},
+        {"code": "post_6"},  # NEW
+        {"code": "post_7"},  # NEW
+    ]
+    downloaded_calls = []
+
+    monkeypatch.setattr(
+        "instagram_watcher.iterate_profile_posts",
+        lambda *args, **kwargs: iter(mock_nodes),
+    )
+    monkeypatch.setattr(
+        "instagram_watcher.download_post_media",
+        lambda **kwargs: downloaded_calls.append(kwargs["node"]["code"]) or True,
+    )
+
+    downloaded = watch_profile(
+        profile_input="nasa",
+        limit=10,
+        download_dir=download_dir,
+        db_path=db_file,
+        no_early_stop=True,
+    )
+
+    # Because no_early_stop is True, ignores 5 consecutive existing posts and downloads post_6 and post_7
+    assert downloaded == 2
+    assert downloaded_calls == ["post_6", "post_7"]
 
 
 def test_watch_profile_termination_on_exhausted_posts(monkeypatch, tmp_path: Path):
@@ -344,4 +474,48 @@ def test_fetch_profile_posts_wrapper(monkeypatch):
     posts = fetch_profile_posts("nasa", limit=4)
     assert len(posts) == 4
     assert [p["code"] for p in posts] == ["post_1", "post_2", "post_3", "post_4"]
+
+
+def test_iterate_profile_posts_authenticated(monkeypatch):
+    # Simulated logged-in HTML (no timeline scripts)
+    mock_html = '<html><head><script>["DTSGInitialData",[],{"token":"dtsg_token_123"}]</script></head><body></body></html>'
+
+    mock_session = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = mock_html
+    mock_session.get.return_value = mock_resp
+    mock_session.cookies = {"sessionid": "valid_session", "csrftoken": "valid_csrf", "ds_user_id": "999"}
+
+    page1_nodes = [{"code": f"auth_p1_{i}", "media_type": 1, "user": {"pk": "999"}} for i in range(1, 13)]
+    page1_info = {"has_next_page": True, "end_cursor": "cursor_auth_1"}
+
+    page2_nodes = [{"code": f"auth_p2_{i}", "media_type": 1} for i in range(1, 6)]
+    page2_info = {"has_next_page": False, "end_cursor": None}
+
+    def mock_fetch_page(*args, **kwargs):
+        cursor = kwargs.get("end_cursor", "")
+        if not cursor:
+            return page1_nodes, page1_info
+        elif cursor == "cursor_auth_1":
+            return page2_nodes, page2_info
+        return [], {}
+
+    monkeypatch.setattr("instagram_watcher.fetch_profile_posts_page_graphql", mock_fetch_page)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    posts = list(
+        iterate_profile_posts(
+            username="testuser",
+            limit=15,
+            session=mock_session,
+        )
+    )
+
+    assert len(posts) == 15
+    assert posts[0]["code"] == "auth_p1_1"
+    assert posts[11]["code"] == "auth_p1_12"
+    assert posts[12]["code"] == "auth_p2_1"
+    assert posts[14]["code"] == "auth_p2_3"
+
 
